@@ -402,6 +402,7 @@ run_plt(State, Plt, Output, Analysis, Files) ->
     GetWarnings = get_config(State, get_warnings, false),
     Opts = [{analysis_type, Analysis},
             {get_warnings, GetWarnings},
+            {output_format, get_config(State, output_format, formatted)},
             {init_plt, Plt},
             {output_plt, Plt},
             {from, byte_code},
@@ -471,6 +472,7 @@ build_plt(State, Plt, Output, Files) ->
     GetWarnings = get_config(State, get_warnings, false),
     Opts = [{analysis_type, plt_build},
             {get_warnings, GetWarnings},
+            {output_format, get_config(State, output_format, formatted)},
             {output_plt, Plt},
             {files, Files}],
     run_dialyzer(State, Opts, Output).
@@ -492,6 +494,7 @@ succ_typings_(State, Plt, Output, Files) ->
     ?INFO("Analyzing ~b files with ~ts...", [length(Files), rebar_dir:format_source_file_name(Plt)]),
     Opts = [{analysis_type, succ_typings},
             {get_warnings, true},
+            {output_format, get_config(State, output_format, formatted)},
             {from, byte_code},
             {files, Files},
             {init_plt, Plt}],
@@ -539,8 +542,8 @@ run_dialyzer(State, Opts, Output) ->
             {Warnings, State};
         false ->
             Opts2 = [{warnings, no_warnings()},
-                     {check_plt, false} |
-                     Opts],
+                        {check_plt, false} |
+                        Opts],
             ?DEBUG("Running dialyzer with options: ~p~n", [Opts2]),
             dialyzer:run(Opts2),
             {0, State}
@@ -556,18 +559,36 @@ legacy_warnings(Warnings) ->
 
 format_warnings(Opts, Output, Warnings) ->
     Warnings1 = rebar_dialyzer_format:format_warnings(Opts, Warnings),
-    console_warnings(Warnings1),
-    file_warnings(Output, Warnings),
+    Config =
+        case dict:find(dialyzer, Opts) of
+            {ok, Value} -> Value;
+            _ -> []
+        end,
+    case proplists:get_value(console_warnings, Config, true) of
+        true ->
+            console_warnings(Warnings1);
+        false ->
+            ok
+    end,
+    file_warnings(Output, Warnings,
+        proplists:get_value(output_format, Config, formatted)),
     length(Warnings).
 
 console_warnings(Warnings) ->
     _ = [?CONSOLE("~ts", [Warning]) || Warning <- Warnings],
     ok.
 
-file_warnings(_, []) ->
+file_warnings(_, [], _) ->
     ok;
-file_warnings(Output, Warnings) ->
-    Warnings1 = [[dialyzer:format_warning(Warning, fullpath), $\n] || Warning <- Warnings],
+file_warnings(Output, Warnings, WarningFormat) ->
+    Warnings1 =
+        case WarningFormat of
+            raw ->
+                [[io_lib:format("~tp. \n",
+                             [W]) || W <- Warnings]];
+            formatted ->
+                [[dialyzer:format_warning(Warning, fullpath), $\n] || Warning <- Warnings]
+        end,
     case file:write_file(Output, Warnings1, [append]) of
         ok ->
             ok;
