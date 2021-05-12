@@ -76,6 +76,9 @@ desc() ->
     "`output_format` - configure whether the dialyzer_warnings file will have "
     "the `raw` or `formatted` output\n"
     "\n"
+    "`console_warnings` - configure whether to print dialyzer warnings to "
+    "console\n"
+    "\n"
     "For example, to warn on unmatched returns: \n"
     "{dialyzer, [{warnings, [unmatched_returns]}]}.\n"
     "\n"
@@ -560,9 +563,15 @@ legacy_warnings(Warnings) ->
     end.
 
 format_warnings(Opts, Output, Warnings) ->
-    Warnings1 = rebar_dialyzer_format:format_warnings(Opts, Warnings),
-    console_warnings(Warnings1),
     Config = rebar_opts:get(Opts, dialyzer, []),
+    WarningsToConsole = proplists:get_value(console_warnings, Config, true),
+    case WarningsToConsole of
+        true ->
+            Warnings1 = rebar_dialyzer_format:format_warnings(Opts, Warnings),
+            console_warnings(Warnings1);
+        false ->
+            ok
+    end,
     OutputFormat = proplists:get_value(output_format, Config, formatted),
     file_warnings(Output, Warnings, OutputFormat),
     length(Warnings).
