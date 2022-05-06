@@ -828,7 +828,13 @@ format_skipped({User, Auto}) ->
 maybe_cover_compile(State) ->
     {RawOpts, _} = rebar_state:command_parsed_args(State),
     State1 = case proplists:get_value(cover, RawOpts, false) of
-        true  -> rebar_state:set(State, cover_enabled, true);
+        true  ->
+            S1 = rebar_state:set(State, cover_enabled, true),
+            CoverInclMods = case proplists:get_value(cover_incl_mods, RawOpts) of
+                undefined -> undefined;
+                Mods -> split_string(Mods)
+            end,
+            rebar_state:set(S1, cover_incl_mods, CoverInclMods);
         false -> State
     end,
     rebar_prv_cover:maybe_cover_compile(State1).
@@ -856,6 +862,7 @@ ct_opts(_State) ->
      {logopts, undefined, "logopts", string, help(logopts)}, %% comma-separated list
      {verbosity, undefined, "verbosity", integer, help(verbosity)}, %% Integer
      {cover, $c, "cover", {boolean, false}, help(cover)},
+     {cover_incl_mods, undefined, "cover_incl_mods", string, help(cover_incl_mods)}, %% comma-separated list
      {cover_export_name, undefined, "cover_export_name", string, help(cover_export_name)},
      {repeat, undefined, "repeat", integer, help(repeat)}, %% integer
      {duration, undefined, "duration", string, help(duration)}, % format: HHMMSS
@@ -911,6 +918,8 @@ help(verbosity) ->
     "Verbosity";
 help(cover) ->
     "Generate cover data";
+help(cover_incl_mods) ->
+    "List of modules to include for coverage";
 help(cover_export_name) ->
     "Base name of the coverdata file to write";
 help(repeat) ->
