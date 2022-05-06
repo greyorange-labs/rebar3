@@ -45,9 +45,12 @@ do(State) ->
 
 -spec maybe_cover_compile(rebar_state:t()) -> ok.
 maybe_cover_compile(State) ->
-    maybe_cover_compile(State, apps).
+    case rebar_state:get(State, cover_incl_mods, undefined) of
+        undefined -> maybe_cover_compile(State, apps);
+        Mods -> maybe_cover_compile(State, {modules, Mods})
+    end.
 
--spec maybe_cover_compile(rebar_state:t(), [file:name()] | apps) -> ok.
+-spec maybe_cover_compile(rebar_state:t(), [file:name()] | apps | {modules, [module()]}) -> ok.
 maybe_cover_compile(State, Dirs) ->
     case rebar_state:get(State, cover_enabled, false) of
         true  -> cover_compile(State, Dirs);
@@ -92,8 +95,14 @@ analyze(State) ->
     %% in order for cover data to be reloaded
     %% this maybe breaks if modules have been deleted
     %% since code coverage was collected?
-    {ok, S} = rebar_prv_compile:do(State),
-    ok = cover_compile(S, apps),
+    {ok, S1} = rebar_prv_compile:do(State),
+    {RawOpts, _} = rebar_state:command_parsed_args(S1),
+    CoverInclMods = case proplists:get_value(cover_incl_mods, RawOpts) of
+        undefined -> undefined;
+        Mods -> rebar_string:lexemes(Mods, [$,])
+    end,
+    S2 = rebar_state:set(S1, cover_incl_mods, CoverInclMods),
+    ok = maybe_cover_compile(S2),
     do_analyze(State).
 
 do_analyze(State) ->
@@ -319,6 +328,17 @@ cover_compile(State, apps) ->
     Apps = filter_checkouts_and_excluded(rebar_state:project_apps(State), ExclApps),
     AppDirs = app_dirs(Apps),
     cover_compile(State, lists:filter(fun(D) -> ec_file:is_dir(D) end, AppDirs));
+cover_compile(State, {modules, Mods}) ->
+    rebar_paths:set_paths([deps], State),
+    %% start the cover server if necessary
+    {ok, CoverPid} = start_cover(),
+    %% redirect cover output
+    true = redirect_cover_output(State, CoverPid),
+    ?DEBUG("cover compiling modules: ~p", [Mods]),
+    lists:foreach(fun(Module) ->
+        cover_compile_module(erlang:list_to_atom(Module))
+    end, Mods),
+    ok;
 cover_compile(State, Dirs) ->
     rebar_paths:set_paths([deps], State),
     %% start the cover server if necessary
@@ -353,6 +373,12 @@ is_ignored(Dir, File, ExclMods) ->
                         ExclMods),
     Ignored andalso ?DEBUG("cover ignoring ~p ~p", [Dir, File]),
     Ignored.
+
+cover_compile_module(Module) ->
+    case catch cover:compile_beam(Module) of
+        {ok, _} -> ok;
+        Error -> ?WARN("Cover compilation failed: ~p", [Error])
+    end.
 
 cover_compile_file(FileName) ->
     case catch(cover:compile_beam(FileName)) of
@@ -436,8 +462,10 @@ cover_dir(State) ->
 cover_opts(_State) ->
     [{reset, $r, "reset", boolean, help(reset)},
      {verbose, $v, "verbose", boolean, help(verbose)},
+     {cover_incl_mods, undefined, "cover_incl_mods", string, help(cover_incl_mods)}, %% comma-separated list
      {min_coverage, $m, "min_coverage", integer, help(min_coverage)}].
 
 help(reset) -> "Reset all coverdata.";
 help(verbose) -> "Print coverage analysis.";
+help(cover_incl_mods) -> "List of modules to include for coverage";
 help(min_coverage) -> "Mandate a coverage percentage required to succeed (0..100)".

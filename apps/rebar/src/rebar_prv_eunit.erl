@@ -551,7 +551,13 @@ apply_sys_config(State) ->
 maybe_cover_compile(State) ->
     {RawOpts, _} = rebar_state:command_parsed_args(State),
     State1 = case proplists:get_value(cover, RawOpts, false) of
-        true  -> rebar_state:set(State, cover_enabled, true);
+        true  ->
+            S1 = rebar_state:set(State, cover_enabled, true),
+            CoverInclMods = case proplists:get_value(cover_incl_mods, RawOpts) of
+                undefined -> undefined;
+                Mods -> rebar_string:lexemes(Mods, [$,])
+            end,
+            rebar_state:set(S1, cover_incl_mods, CoverInclMods);
         false -> State
     end,
     rebar_prv_cover:maybe_cover_compile(State1).
@@ -575,6 +581,7 @@ eunit_opts(_State) ->
     [{app, undefined, "app", string, help(app)},
      {application, undefined, "application", string, help(app)},
      {cover, $c, "cover", boolean, help(cover)},
+     {cover_incl_mods, undefined, "cover_incl_mods", string, help(cover_incl_mods)},
      {cover_export_name, undefined, "cover_export_name", string, help(cover_export_name)},
      {profile, $p, "profile", boolean, help(profile)},
      {dir, $d, "dir", string, help(dir)},
@@ -591,6 +598,7 @@ eunit_opts(_State) ->
 
 help(app)       -> "Comma separated list of application test suites to run. Equivalent to `[{application, App}]`.";
 help(cover)     -> "Generate cover data. Defaults to false.";
+help(cover_incl_mods) -> "List of modules to include for coverage";
 help(cover_export_name) -> "Base name of the coverdata file to write";
 help(profile)   -> "Show the slowest tests. Defaults to false.";
 help(dir)       -> "Comma separated list of dirs to load tests from. Equivalent to `[{dir, Dir}]`.";
