@@ -1,12 +1,9 @@
 name: Common Test
 
-on:
-  pull_request:
-    branches:
-      - 'main'
-  push:
-    branches:
-      - 'main'
+on: [pull_request, push]
+
+env:
+  LATEST_OTP_RELEASE: 27
 
 jobs:
   linux:
@@ -15,14 +12,11 @@ jobs:
 
     strategy:
       matrix:
-        otp_version: [22, 23, 24]
+        otp_version: [25, 26, 27]
         os: [ubuntu-latest]
 
     container:
       image: erlang:${{ matrix.otp_version }}
-
-    env:
-      LATEST_OTP_RELEASE: 24
 
     steps:
     - uses: actions/checkout@v2
@@ -33,7 +27,9 @@ jobs:
     - shell: bash
       name: Dialyzer
       run: |
-        [[ "${{ matrix.otp_version }}" != "${{ env.LATEST_OTP_RELEASE }}" ]] || (./rebar3 clean -a && ./rebar3 as dialyzer dialyzer)
+        ./rebar3 clean -a
+        ./rebar3 as dialyzer dialyzer
+      if: ${{ matrix.otp_version == env.LATEST_OTP_RELEASE }}
 
   macos:
     name: Test on MacOS
@@ -43,10 +39,22 @@ jobs:
     - uses: actions/checkout@v2
     - name: Brew Version Check
       run: brew --version
+    - name: Brew Cleanup
+      run: |
+        brew cleanup --prune=all -s
+        brew autoremove
+    - name: Brew Untap Casks
+      run: brew untap homebrew/cask homebrew/core
     - name: Keep Brew Fresh
-      run: brew update
+      run: |
+        brew update || true
+        brew upgrade || true
+    - name: Debug Brew
+      run: brew doctor || true
     - name: Install Erlang
-      run: brew install erlang
+      #run: brew install erlang@${{ env.LATEST_OTP_RELEASE }}
+      # fall back to OTP-26 since OTP 27.0 doesn't build on homebrew due to manpages issues
+      run: brew install erlang@26
     - name: Compile
       run: ./bootstrap
     - name: CT tests

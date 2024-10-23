@@ -27,6 +27,9 @@
 
 {minimum_otp_vsn, "21.0"}.
 
+%% Should errors be in a rich format, or a minimal one (tool-friendly)
+{compiler_error_format, rich}.
+
 %% MIB Options?
 {mib_opts, []}.
 %% SNMP mibs to compile first?
@@ -51,7 +54,7 @@
 %% files by prefixing extensions.
 {application_resource_extensions, [
     ".app.src.script", ".app.src"
-]}
+]}.
 
 %% == Common Test ==
 
@@ -120,7 +123,8 @@
     {plt_prefix, "rebar3"},
     {base_plt_apps, [stdlib, kernel, crypto]},
     {base_plt_location, global}, % global | "/my/file/name"
-    {base_plt_prefix, "rebar3"}
+    {base_plt_prefix, "rebar3"},
+    incremental
 ]}.
 
 
