@@ -48,13 +48,42 @@ maybe_cover_compile(State) ->
     case rebar_state:get(State, cover_incl_mods, undefined) of
         undefined -> maybe_cover_compile(State, apps);
         Mods -> maybe_cover_compile(State, {modules, Mods})
-    end.
+    end,
+    maybe_backup_cover_data(),
+    ?INFO("cover_internal_mapping_table = ~p", [ets:info(cover_internal_mapping_table)]),
+    ?INFO("cover_binary_code_table = ~p", [ets:info(cover_binary_code_table)]),
+    ?INFO("cover_collected_remote_data_table = ~p", [ets:info(cover_collected_remote_data_table)]),
+    ok.
 
 -spec maybe_cover_compile(rebar_state:t(), [file:name()] | apps | {modules, [module()]}) -> ok.
 maybe_cover_compile(State, Dirs) ->
     case rebar_state:get(State, cover_enabled, false) of
         true  -> cover_compile(State, Dirs);
         false -> ok
+    end.
+
+restore_pre_compiled_cover_data() ->
+    ets:file2tab("cover_binary_code_table_bkp.ets"),
+    ets:file2tab("cover_collected_remote_data_table_bkp.ets"),
+    ObjectList1 = ets:tab2list(cover_binary_code_table_bkp),
+    ObjectList2 = ets:tab2list(cover_collected_remote_data_table_bkp),
+    ets:insert(cover_binary_code_table, ObjectList1),
+    ets:insert(cover_collected_remote_data_table, ObjectList2),
+    ok.
+
+maybe_backup_cover_data() ->
+    case os:getenv("BACKUP_PRE_COMPILE_DATA") of
+        "true" ->
+            ObjectList1 = ets:tab2list(cover_binary_code_table),
+            ObjectList2 = ets:tab2list(cover_collected_remote_data_table),
+            ets:new(cover_binary_code_table_bkp, [ordered_set, named_table, public]),
+            ets:new(cover_collected_remote_data_table_bkp, [ordered_set, named_table, public]),
+            ets:insert(cover_collected_remote_data_table_bkp, ObjectList2),
+            ets:insert(cover_binary_code_table_bkp, ObjectList1),
+            ets:tab2file(cover_binary_code_table_bkp, "cover_binary_code_table_bkp.ets", [{sync, true}]),
+            ets:tab2file(cover_collected_remote_data_table_bkp, "cover_collected_remote_data_table_bkp.ets", [{sync, true}]);
+        _ ->
+            ?INFO("Not backing up cover data tables, set BACKUP_PRE_COMPILE_DATA to true to enable", [])
     end.
 
 -spec maybe_write_coverdata(rebar_state:t(), atom()) -> ok.
@@ -345,25 +374,35 @@ cover_compile(State, Dirs) ->
     {ok, CoverPid} = start_cover(),
     %% redirect cover output
     true = redirect_cover_output(State, CoverPid),
-    ExclMods = rebar_state:get(State, cover_excl_mods, []),
-    ?DEBUG("Ignoring cover compilation of modules in {cover_excl_mods, ~p}", [ExclMods]),
-    lists:foreach(fun(Dir) ->
-        case file:list_dir(Dir) of
-            {ok, Files} ->
-                ?DEBUG("cover compiling ~p", [Dir]),
-                [cover_compile_file(filename:join(Dir, File))
-                 || File <- Files,
-                    filename:extension(File) == ".beam",
-                    not is_ignored(Dir, File, ExclMods)],
-                ok;
-            {error, eacces} ->
-                ?WARN("Directory ~p not readable, modules will not be included in coverage", [Dir]);
-            {error, enoent} ->
-                ?WARN("Directory ~p not found", [Dir]);
-            {error, Reason} ->
-                ?WARN("Directory ~p error ~p", [Dir, Reason])
-        end
-    end, Dirs),
+    case os:getenv("LOAD_PRE_COMPILE_DATA") of
+        "true" ->
+            try restore_pre_compiled_cover_data() of
+                ok -> ?INFO("Successfully restored pre-compiled cover data", []);
+                {error, Reason} -> ?WARN("Failed to restore pre-compiled cover data: ~p", [Reason])
+            catch
+                _:Reason -> ?WARN("Failed to restore pre-compiled cover data: ~p", [Reason])
+            end;
+        _Else ->
+            ExclMods = rebar_state:get(State, cover_excl_mods, []),
+            ?DEBUG("Ignoring cover compilation of modules in {cover_excl_mods, ~p}", [ExclMods]),
+            lists:foreach(fun(Dir) ->
+                case file:list_dir(Dir) of
+                    {ok, Files} ->
+                        ?DEBUG("cover compiling ~p", [Dir]),
+                        [cover_compile_file(filename:join(Dir, File))
+                        || File <- Files,
+                            filename:extension(File) == ".beam",
+                            not is_ignored(Dir, File, ExclMods)],
+                        ok;
+                    {error, eacces} ->
+                        ?WARN("Directory ~p not readable, modules will not be included in coverage", [Dir]);
+                    {error, enoent} ->
+                        ?WARN("Directory ~p not found", [Dir]);
+                    {error, Reason} ->
+                        ?WARN("Directory ~p error ~p", [Dir, Reason])
+                end
+            end, Dirs)
+    end,
     ok.
 
 is_ignored(Dir, File, ExclMods) ->

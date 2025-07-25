@@ -92,12 +92,19 @@ run_tests(State, Opts) ->
     Opts2 = turn_off_auto_compile(Opts1),
     ?DEBUG("Running tests with {ct_opts, ~p}.", [Opts2]),
     {RawOpts, _} = rebar_state:command_parsed_args(State),
-    Result = case proplists:get_value(verbose, RawOpts, false) of
-        true  -> run_test_verbose(Opts2);
-        false -> run_test_quiet(Opts2)
-    end,
-    ok = maybe_write_coverdata(State),
-    Result.
+
+    %% Check if parallel execution is requested
+    case proplists:get_value(parallel, RawOpts, false) of
+        true ->
+            run_tests_parallel(State, Opts2, RawOpts);
+        false ->
+            Result = case proplists:get_value(verbose, RawOpts, false) of
+                true  -> run_test_verbose(Opts2);
+                false -> run_test_quiet(Opts2)
+            end,
+            ok = maybe_write_coverdata(State),
+            Result
+    end.
 
 -spec format_error(any()) -> iolist().
 format_error({error, Reason}) ->
@@ -106,6 +113,10 @@ format_error({error_running_tests, Reason}) ->
     format_error({error, Reason});
 format_error({failures_running_tests, {Failed, AutoSkipped}}) ->
     io_lib:format("Failures occurred running tests: ~b", [Failed+AutoSkipped]);
+format_error({error_discovering_suites, Reason}) ->
+    io_lib:format("Error discovering test suites: ~p", [Reason]);
+format_error({error_init_distributed, Reason}) ->
+    io_lib:format("Error initializing distributed mode: ~p", [Reason]);
 format_error({badconfig, {Msg, {Value, Key}}}) ->
     io_lib:format(Msg, [Value, Key]);
 format_error({badconfig, Msg}) ->
@@ -204,6 +215,9 @@ transform_opts([{verbose, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
 %% drop fail_fast from opts, ct doesn't care about it
 transform_opts([{fail_fast, _}|Rest], Acc) ->
+    transform_opts(Rest, Acc);
+%% drop parallel from opts, ct doesn't care about it
+transform_opts([{parallel, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
 %% getopt should handle anything else
 transform_opts([Opt|Rest], Acc) ->
@@ -339,8 +353,9 @@ select_tests(State, ProjectApps, CmdOpts, CfgOpts) ->
 %%   common_test and are not taken into account here.
 merge_opts(CmdOpts0, CfgOpts0) ->
     TestSelectOpts = [spec,dir,suite,group,testcase],
-    CmdOpts = lists:ukeysort(1, CmdOpts0),
-    CfgOpts1 = lists:ukeysort(1, CfgOpts0),
+    %% Filter out non-tuple options like 'help' before sorting
+    CmdOpts = lists:ukeysort(1, [Opt || Opt <- CmdOpts0, is_tuple(Opt)]),
+    CfgOpts1 = lists:ukeysort(1, [Opt || Opt <- CfgOpts0, is_tuple(Opt)]),
     CfgOpts = case is_any_defined(TestSelectOpts,CmdOpts) of
                   false ->
                       CfgOpts1;
@@ -755,6 +770,379 @@ setup_logdir(State, Opts) ->
 turn_off_auto_compile(Opts) ->
     [{auto_compile, false}|lists:keydelete(auto_compile, 1, Opts)].
 
+%% Parallel CT execution
+run_tests_parallel(State, Opts, RawOpts) ->
+    ?INFO("Running Common Test suites in parallel, Opts = ~p", [Opts]),
+
+    %% Ensure distributed mode is enabled
+    case init_distributed_mode(State) of
+        ok ->
+            case discover_suites_for_parallel(State, Opts) of
+                {ok, Suites} when length(Suites) > 0 ->
+                    ?INFO("Discovered ~p suites for parallel execution", [length(Suites)]),
+                    ?DEBUG("Suites: ~p", [Suites]),
+                    run_suites_parallel(State, Suites, Opts, RawOpts);
+                {ok, []} ->
+                    ?INFO("No suites found for parallel execution, falling back to sequential", []),
+                    run_sequential_fallback(State, Opts, RawOpts);
+                {error, Reason} ->
+                    ?PRV_ERROR({error_discovering_suites, Reason})
+            end;
+        {error, Reason} ->
+            ?PRV_ERROR({error_init_distributed, Reason})
+    end.
+
+%% Initialize distributed mode for the master node
+init_distributed_mode(State) ->
+    case erlang:is_alive() of
+        true ->
+            ok;
+        false ->
+            {RawOpts, _} = rebar_state:command_parsed_args(State),
+            ?INFO("RawOpts = ~p", [RawOpts]),
+            {NodeName, NameDomain} = case {proplists:get_value(name, RawOpts), proplists:get_value(sname, RawOpts)} of
+                {undefined, undefined} ->
+                    %% Create a temporary short name
+                    ShortName = list_to_atom("rebar3_ct_master_" ++ integer_to_list(erlang:phash2(make_ref()))),
+                    {ShortName, shortnames};
+                {Long, undefined} ->
+                    {Long, longnames};
+                {undefined, Short} ->
+                    {Short, shortnames};
+                {Long, _} ->
+                    %% Long name takes precedence
+                    {Long, longnames}
+            end,
+            case net_kernel:start([NodeName, NameDomain]) of
+                {ok, _} ->
+                    %% Set cookie if provided
+                    case proplists:get_value(setcookie, RawOpts) of
+                        undefined -> ok;
+                        Cookie -> erlang:set_cookie(NodeName, Cookie)
+                    end,
+                    ok;
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% Discover suites from the test options
+discover_suites_for_parallel(State, Opts) ->
+    case proplists:get_value(spec, Opts) of
+        undefined ->
+            discover_from_dirs_and_suites(State, Opts);
+        Specs when is_list(Specs) ->
+            discover_from_specs(Specs);
+        Spec ->
+            discover_from_specs([Spec])
+    end.
+
+%% Discover suites from directories and suite options
+discover_from_dirs_and_suites(State, Opts) ->
+    case {proplists:get_value(suite, Opts), proplists:get_value(dir, Opts)} of
+        {undefined, undefined} ->
+            %% No specific suites or dirs, scan default test directories
+            discover_from_default_dirs(State);
+        {Suites, undefined} when is_list(Suites) ->
+            %% Specific suites provided
+            {ok, lists:map(fun suite_name_from_path/1, Suites)};
+        {Suite, undefined} ->
+            %% Single suite
+            {ok, [suite_name_from_path(Suite)]};
+        {undefined, Dirs} when is_list(Dirs) ->
+            %% Scan directories for suites
+            discover_from_directories(Dirs);
+        {undefined, Dir} ->
+            %% Single directory
+            discover_from_directories([Dir]);
+        {Suites, _Dirs} when is_list(Suites) ->
+            %% Both suites and dirs specified, use suites
+            {ok, lists:map(fun suite_name_from_path/1, Suites)};
+        {Suite, _Dir} ->
+            %% Single suite with dir
+            {ok, [suite_name_from_path(Suite)]}
+    end.
+
+%% Discover suites from spec files
+discover_from_specs(Specs) ->
+    try
+        case get_tests_from_specs(Specs) of
+            {ok, Tests} ->
+                Suites = extract_suites_from_tests(Tests),
+                {ok, Suites};
+            {error, Reason} ->
+                {error, Reason}
+        end
+    catch
+        _:Error ->
+            {error, {spec_parsing_error, Error}}
+    end.
+
+%% Extract suite names from CT test specifications
+extract_suites_from_tests(Tests) ->
+    Suites = lists:foldl(fun({_Spec, NodeRunSkips}, Acc) ->
+        extract_suites_from_node_run_skips(NodeRunSkips) ++ Acc
+    end, [], Tests),
+    lists:usort(Suites).
+
+extract_suites_from_node_run_skips(NodeRunSkips) ->
+    lists:foldl(fun({_Node, Runs, _Skips}, Acc) ->
+        extract_suites_from_runs(Runs) ++ Acc
+    end, [], NodeRunSkips).
+
+extract_suites_from_runs(Runs) ->
+    lists:foldl(fun
+        ({Dir, Suites}, Acc) when is_list(Suites) ->
+            SuiteNames = lists:map(fun(Suite) ->
+                suite_name_from_path(filename:join([Dir, Suite]))
+            end, Suites),
+            SuiteNames ++ Acc;
+        (_, Acc) ->
+            Acc
+    end, [], Runs).
+
+%% Discover suites from default test directories
+discover_from_default_dirs(State) ->
+    ProjectApps = rebar_state:project_apps(State),
+    BareTest = filename:join([rebar_state:dir(State), "test"]),
+    AppTestDirs = [filename:join([rebar_app_info:dir(App), "test"])
+                   || App <- ProjectApps,
+                      filelib:is_dir(filename:join([rebar_app_info:dir(App), "test"]))],
+    AllDirs = case filelib:is_dir(BareTest) of
+        true -> [BareTest | AppTestDirs];
+        false -> AppTestDirs
+    end,
+    discover_from_directories(AllDirs).
+
+%% Discover suites from directories
+discover_from_directories(Dirs) ->
+    try
+        Suites = lists:foldl(fun(Dir, Acc) ->
+            case filelib:is_dir(Dir) of
+                true ->
+                    SuiteFiles = filelib:wildcard(filename:join([Dir, "*_SUITE.beam"])),
+                    SuiteNames = [suite_name_from_path(Suite) || Suite <- SuiteFiles],
+                    SuiteNames ++ Acc;
+                false ->
+                    Acc
+            end
+        end, [], Dirs),
+        {ok, lists:usort(Suites)}
+    catch
+        _:Error ->
+            {error, {directory_scan_error, Error}}
+    end.
+
+%% Extract suite name from file path
+suite_name_from_path(Path) ->
+    Basename = filename:basename(Path, ".beam"),
+    case filename:basename(Basename, ".erl") of
+        Name when is_list(Name) ->
+            list_to_atom(Name);
+        Name ->
+            Name
+    end.
+
+%% Run suites in parallel
+run_suites_parallel(State, Suites, Opts, RawOpts) ->
+    ?INFO("Starting parallel execution of ~p suites", [length(Suites)]),
+
+    %% Setup cover compilation once on master
+    ok = maybe_cover_compile(State),
+
+    %% Get paths for slave nodes
+    CodePaths = get_code_paths(State),
+    LogDir = proplists:get_value(logdir, Opts),
+
+    %% Start slave nodes and run tests
+    Parent = self(),
+    Verbose = proplists:get_value(verbose, RawOpts, false),
+
+    Monitors = lists:map(fun(Suite) ->
+        erlang:spawn_monitor(fun() ->
+            run_suite_on_slave(Parent, Suite, CodePaths, LogDir, Opts, State)
+        end)
+    end, Suites),
+
+    %% Collect results
+    Results = collect_parallel_results(Monitors, Suites, Verbose, []),
+
+    %% Write coverage data
+    ok = maybe_write_coverdata(State),
+
+    %% Process and return results
+    process_parallel_results(Results, LogDir).
+
+%% Get code paths for slave nodes
+get_code_paths(State) ->
+    CodePaths = code:get_path(),
+    %% Add project-specific paths
+    ProjectPaths = rebar_state:code_paths(State, all),
+    lists:usort(CodePaths ++ ProjectPaths).
+
+%% Run a suite on a slave node
+run_suite_on_slave(Parent, Suite, CodePaths, LogDir, Opts, State) ->
+    SuiteName = atom_to_list(Suite),
+    NodeName = list_to_atom("ct_slave_" ++ SuiteName ++ "_" ++ integer_to_list(erlang:phash2(make_ref()))),
+    SuiteLogDir = filename:join([LogDir, SuiteName ++ "_logs"]),
+
+    %% Prepare slave arguments
+    PathArgs = lists:foldl(fun(Path, Acc) ->
+        ["-pa", Path | Acc]
+    end, [], CodePaths),
+
+    Cookie = erlang:get_cookie(),
+    SlaveArgs = ["-setcookie", atom_to_list(Cookie)] ++ PathArgs,
+
+    try
+        %% Start peer node (replacement for slave)
+        case peer:start_link(#{name => NodeName, args => SlaveArgs}) of
+            {ok, Peer, Node} ->
+                ?DEBUG("Started peer node ~p for suite ~p", [Node, Suite]),
+
+                %% Add node to cover if cover is enabled
+                {RawOpts, _} = rebar_state:command_parsed_args(State),
+                case proplists:get_value(cover, RawOpts, false) of
+                    true ->
+                        case cover:start(Node) of
+                            {ok, _} -> ok;
+                            {error, already_started} -> ok;
+                            {error, Reason} ->
+                                ?WARN("Failed to start cover on node ~p: ~p", [Node, Reason])
+                        end;
+                    false ->
+                        ok
+                end,
+
+                %% Prepare CT options for this suite
+                SuiteOpts = prepare_suite_opts(Suite, SuiteLogDir, Opts),
+
+                %% Run the test on the peer node
+                Result = rpc:call(Node, ct, run_test, [SuiteOpts]),
+
+                %% Clean up
+                peer:stop(Peer),
+
+                Parent ! {self(), Suite, Result};
+            {error, Reason} ->
+                ?ERROR("Failed to start peer node for suite ~p: ~p", [Suite, Reason]),
+                Parent ! {self(), Suite, {error, {peer_start_failed, Reason}}}
+        end
+    catch
+        Class:Error:Stacktrace ->
+            ?ERROR("Exception running suite ~p: ~p:~p~n~p", [Suite, Class, Error, Stacktrace]),
+            Parent ! {self(), Suite, {error, {exception, Class, Error}}}
+    end.
+
+%% Prepare CT options for a specific suite
+prepare_suite_opts(Suite, LogDir, BaseOpts) ->
+    %% Remove options that don't apply to single suite runs
+    FilteredOpts = lists:filter(fun
+        ({dir, _}) -> false;
+        ({spec, _}) -> false;
+        ({suite, _}) -> false;
+        ({logdir, _}) -> false;
+        (_) -> true
+    end, BaseOpts),
+
+    %% Add suite-specific options
+    [{suite, [atom_to_list(Suite)]}, {logdir, LogDir} | FilteredOpts].
+
+%% Collect results from parallel execution
+collect_parallel_results([], _Suites, _Verbose, Results) ->
+    Results;
+collect_parallel_results(Monitors, Suites, Verbose, Results) ->
+    receive
+        {Pid, Suite, Result} ->
+            case lists:keytake(Pid, 1, Monitors) of
+                {value, {Pid, Monitor}, RestMonitors} ->
+                    erlang:demonitor(Monitor, [flush]),
+                    case Verbose of
+                        true -> format_suite_result(Suite, Result);
+                        false -> ok
+                    end,
+                    collect_parallel_results(RestMonitors, Suites, Verbose, [{Suite, Result} | Results]);
+                false ->
+                    collect_parallel_results(Monitors, Suites, Verbose, Results)
+            end;
+        {'DOWN', Monitor, process, Pid, Reason} ->
+            case lists:keytake(Pid, 1, Monitors) of
+                {value, {Pid, Monitor}, RestMonitors} ->
+                    %% Find which suite this was for
+                    Index = length(Monitors) - length(RestMonitors),
+                    Suite = lists:nth(Index, Suites),
+                    ?ERROR("Process for suite ~p died: ~p", [Suite, Reason]),
+                    collect_parallel_results(RestMonitors, Suites, Verbose,
+                                           [{Suite, {error, {process_died, Reason}}} | Results]);
+                false ->
+                    collect_parallel_results(Monitors, Suites, Verbose, Results)
+            end
+    after 300000 -> % 5 minute timeout
+        ?ERROR("Timeout waiting for parallel test results", []),
+        [{timeout, {error, timeout}} | Results]
+    end.
+
+%% Format result for a single suite
+format_suite_result(Suite, Result) ->
+    case Result of
+        {Passed, Failed, {UserSkipped, AutoSkipped}} ->
+            ?CONSOLE("Suite ~p: ~p passed, ~p failed, ~p skipped", [Suite, Passed, Failed, UserSkipped + AutoSkipped]);
+        {error, Reason} ->
+            ?CONSOLE("Suite ~p: ERROR - ~p", [Suite, Reason]);
+        _ ->
+            ?CONSOLE("Suite ~p: Unknown result - ~p", [Suite, Result])
+    end.
+
+%% Process parallel results and determine final status
+process_parallel_results(Results, LogDir) ->
+    {TotalPassed, TotalFailed, TotalSkipped, FailedSuites} =
+        lists:foldl(fun({Suite, Result}, {Passed, Failed, Skipped, FailedAcc}) ->
+            case Result of
+                {P, F, {US, AS}} ->
+                    NewFailedAcc = case F > 0 orelse AS > 0 of
+                        true -> [Suite | FailedAcc];
+                        false -> FailedAcc
+                    end,
+                    {Passed + P, Failed + F, Skipped + US + AS, NewFailedAcc};
+                {error, _} ->
+                    {Passed, Failed + 1, Skipped, [Suite | FailedAcc]};
+                _ ->
+                    {Passed, Failed + 1, Skipped, [Suite | FailedAcc]}
+            end
+        end, {0, 0, 0, []}, Results),
+
+    %% Report summary
+    ?CONSOLE("Parallel execution completed:", []),
+    ?CONSOLE("  Total passed: ~p", [TotalPassed]),
+    ?CONSOLE("  Total failed: ~p", [TotalFailed]),
+    ?CONSOLE("  Total skipped: ~p", [TotalSkipped]),
+
+    case FailedSuites of
+        [] ->
+            ?CONSOLE("All suites passed!", []);
+        _ ->
+            ?CONSOLE("Failed suites: ~p", [FailedSuites]),
+            Index = filename:join([LogDir, "index.html"]),
+            ?CONSOLE("Results written to ~p.", [Index])
+    end,
+
+    %% Return appropriate result
+    case {TotalFailed, FailedSuites} of
+        {0, []} ->
+            ok;
+        _ ->
+            ?PRV_ERROR({failures_running_tests, {TotalFailed, length(FailedSuites)}})
+    end.
+
+%% Fallback to sequential execution if parallel is not possible
+run_sequential_fallback(State, Opts, RawOpts) ->
+    Result = case proplists:get_value(verbose, RawOpts, false) of
+        true  -> run_test_verbose(Opts);
+        false -> run_test_quiet(Opts)
+    end,
+    ok = maybe_write_coverdata(State),
+    Result.
+
 run_test_verbose(Opts) -> handle_results(ct:run_test(Opts)).
 
 run_test_quiet(Opts) ->
@@ -891,7 +1279,8 @@ ct_opts(_State) ->
      {sys_config, undefined, "sys_config", string, help(sys_config)}, %% comma-separated list
      {compile_only, undefined, "compile_only", boolean, help(compile_only)},
      {retry, undefined, "retry", boolean, help(retry)},
-     {fail_fast, undefined, "fail_fast", {boolean, false}, help(fail_fast)}
+     {fail_fast, undefined, "fail_fast", {boolean, false}, help(fail_fast)},
+     {parallel, undefined, "parallel", {boolean, false}, help(parallel)}
     ].
 
 help(compile_only) ->
@@ -970,5 +1359,7 @@ help(fail_fast) ->
     "Experimental feature. If any test fails, the run is aborted. Since common test does not "
     "support this natively, we abort the rebar3 run on a failure. This May break CT's disk logging and "
     "other rebar3 features.";
+help(parallel) ->
+    "Run test suites in parallel, each on its own Erlang node. Requires all suites to be discovered via spec files or directories.";
 help(_) ->
     "".
