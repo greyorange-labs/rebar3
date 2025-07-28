@@ -91,13 +91,229 @@ run_tests(State, Opts) ->
     Opts1 = setup_logdir(State, T),
     Opts2 = turn_off_auto_compile(Opts1),
     ?DEBUG("Running tests with {ct_opts, ~p}.", [Opts2]),
-    {RawOpts, _} = rebar_state:command_parsed_args(State),
-    Result = case proplists:get_value(verbose, RawOpts, false) of
-        true  -> run_test_verbose(Opts2);
-        false -> run_test_quiet(Opts2)
+    
+    %% Check if we have spec files to run in parallel
+    case proplists:get_value(spec, Opts2) of
+        undefined ->
+            %% No spec files, run normally
+            {RawOpts, _} = rebar_state:command_parsed_args(State),
+            Result = case proplists:get_value(verbose, RawOpts, false) of
+                true  -> run_test_verbose(Opts2);
+                false -> run_test_quiet(Opts2)
+            end,
+            ok = maybe_write_coverdata(State),
+            Result;
+        SpecFiles when is_list(SpecFiles) ->
+            %% Multiple spec files, run in parallel
+            parallel_run_tests(State, Opts2);
+        SpecFile ->
+            %% Single spec file, run in parallel by parsing suites
+            parallel_run_tests(State, Opts2)
+    end.
+
+%% Parallel execution of test suites
+parallel_run_tests(State, Opts) ->
+    ?INFO("Running tests in parallel...", []),
+    
+    case proplists:get_value(spec, Opts) of
+        SpecFiles when is_list(SpecFiles) ->
+            %% Multiple spec files - run each in parallel
+            run_parallel_specs(State, Opts, SpecFiles);
+        SpecFile ->
+            %% Single spec file - parse suites and run in parallel
+            run_parallel_suites(State, Opts, SpecFile, [])
+    end.
+
+%% Run multiple spec files in parallel
+run_parallel_specs(State, Opts, SpecFiles) ->
+    ?INFO("Running ~p spec files in parallel", [length(SpecFiles)]),
+    
+    %% Create tasks for each spec file
+    Tasks = lists:map(fun(SpecFile) ->
+        fun() ->
+            SpecOpts = lists:keyreplace(spec, 1, Opts, {spec, SpecFile}),
+            run_single_spec_in_node(State, SpecOpts, SpecFile)
+        end
+    end, SpecFiles),
+    
+    %% Run tasks in parallel using rebar_parallel
+    Results = rebar_parallel:run(Tasks, #{}),
+    
+    %% Collect and analyze results
+    analyze_parallel_results(Results).
+
+%% Run suites from a single spec file in parallel
+run_parallel_suites(State, Opts, SpecFile, ParsedSuites) ->
+    ?INFO("Parsing spec file: ~s", [SpecFile]),
+    
+    %% Parse the spec file to extract individual suites
+    case parse_spec_file(SpecFile) of
+        {ok, Suites} when length(Suites) > 1 ->
+            ?INFO("Found ~p suites, running in parallel", [length(Suites)]),
+            
+            %% Create tasks for each suite
+            Tasks = lists:map(fun(Suite) ->
+                fun() ->
+                    SuiteOpts = create_suite_opts(Opts, Suite),
+                    run_single_suite_in_node(State, SuiteOpts, Suite)
+                end
+            end, Suites),
+            
+            %% Run tasks in parallel
+            Results = rebar_parallel:run(Tasks, #{}),
+            
+            %% Collect and analyze results
+            analyze_parallel_results(Results);
+        {ok, [_SingleSuite]} ->
+            ?INFO("Only one suite found, running normally", []),
+            %% Fall back to normal execution for single suite
+            {RawOpts, _} = rebar_state:command_parsed_args(State),
+            Result = case proplists:get_value(verbose, RawOpts, false) of
+                true  -> run_test_verbose(Opts);
+                false -> run_test_quiet(Opts)
+            end,
+            ok = maybe_write_coverdata(State),
+            Result;
+        {ok, []} ->
+            ?WARN("No suites found in spec file: ~s", [SpecFile]),
+            ok;
+        {error, Reason} ->
+            ?ERROR("Failed to parse spec file ~s: ~p", [SpecFile, Reason]),
+            {error, Reason}
+    end.
+
+%% Parse spec file to extract suite definitions
+parse_spec_file(SpecFile) ->
+    try
+        case file:consult(SpecFile) of
+            {ok, Terms} ->
+                Suites = extract_suites_from_terms(Terms),
+                {ok, Suites};
+            {error, Reason} ->
+                {error, Reason}
+        end
+    catch
+        Error:Reason ->
+            {error, {Error, Reason}}
+    end.
+
+%% Extract suite definitions from spec file terms
+extract_suites_from_terms(Terms) ->
+    lists:foldl(fun(Term, Acc) ->
+        case Term of
+            {suites, Dir, SuiteList} when is_list(SuiteList) ->
+                SuiteEntries = [{suites, Dir, [Suite]} || Suite <- SuiteList],
+                Acc ++ SuiteEntries;
+            {suite, Dir, Suite} ->
+                Acc ++ [{suites, Dir, [Suite]}];
+            Other ->
+                Acc ++ [Other]
+        end
+    end, [], Terms).
+
+%% Create options for a single suite execution
+create_suite_opts(BaseOpts, {suites, Dir, Suites}) ->
+    %% Remove spec option and add suite-specific options
+    Opts1 = proplists:delete(spec, BaseOpts),
+    Opts2 = [{dir, Dir}, {suite, Suites}] ++ Opts1,
+    Opts2;
+create_suite_opts(BaseOpts, Other) ->
+    ?DEBUG("Unknown suite format: ~p", [Other]),
+    BaseOpts.
+
+%% Run a single suite in a separate node for isolation
+run_single_suite_in_node(State, Opts, Suite) ->
+    %% Create a unique node name for this suite
+    {ok, Hostname} = inet:gethostname(),
+    NodeName = list_to_atom("ct_parallel_" ++ integer_to_list(erlang:unique_integer([positive])) ++ "@" ++ Hostname),
+    
+    ?DEBUG("Starting suite ~p in node ~p", [Suite, NodeName]),
+    
+    %% Set up distributed node if not already distributed
+    case node() of
+        nonode@nohost ->
+            %% Start distribution on this node first
+            MainNodeName = list_to_atom("ct_main_" ++ integer_to_list(erlang:unique_integer([positive])) ++ "@" ++ Hostname),
+            net_kernel:start([MainNodeName, shortnames]);
+        _ ->
+            ok
     end,
-    ok = maybe_write_coverdata(State),
-    Result.
+    
+    %% Get current code path and compiled beam files to share
+    CodePaths = code:get_path(),
+    LoadedMods = [{Mod, code:which(Mod)} || {Mod, _} <- code:all_loaded(), is_list(code:which(Mod))],
+    
+    %% Start the worker node
+    case start_worker_node(NodeName, CodePaths, LoadedMods) of
+        {ok, Node} ->
+            try
+                %% Execute the test suite on the worker node
+                Result = rpc:call(Node, ct, run_test, [Opts]),
+                ?DEBUG("Suite ~p completed with result: ~p", [Suite, Result]),
+                Result
+            catch
+                Error:Reason:Stack ->
+                    ?ERROR("Error running suite ~p: ~p:~p~n~p", [Suite, Error, Reason, Stack]),
+                    {error, {Error, Reason}}
+            after
+                %% Clean up worker node
+                rpc:call(Node, init, stop, []),
+                timer:sleep(1000)  % Give node time to shut down
+            end;
+        {error, Reason} ->
+            ?ERROR("Failed to start worker node for suite ~p: ~p", [Suite, Reason]),
+            {error, Reason}
+    end.
+
+%% Run a single spec file in a separate node
+run_single_spec_in_node(State, Opts, SpecFile) ->
+    ?DEBUG("Running spec file ~s in separate node", [SpecFile]),
+    run_single_suite_in_node(State, Opts, {spec, SpecFile}).
+
+%% Start a worker node with shared compilation
+start_worker_node(NodeName, CodePaths, LoadedMods) ->
+    %% Start the node
+    case slave:start_link(net_adm:localhost(), NodeName, "-setcookie " ++ atom_to_list(erlang:get_cookie())) of
+        {ok, Node} ->
+            %% Share code paths
+            ok = rpc:call(Node, code, set_path, [CodePaths]),
+            
+            %% Share compiled modules (avoiding recompilation)
+            lists:foreach(fun({Mod, BeamFile}) ->
+                case rpc:call(Node, code, ensure_loaded, [Mod]) of
+                    {module, Mod} -> ok;  % Already loaded
+                    _ ->
+                        % Try to load from beam file
+                        case rpc:call(Node, code, load_abs, [filename:rootname(BeamFile)]) of
+                            {module, Mod} -> ok;
+                            _ -> ok  % Skip if can't load
+                        end
+                end
+            end, LoadedMods),
+            
+            %% Start any necessary applications
+            rpc:call(Node, application, ensure_all_started, [common_test]),
+            
+            {ok, Node};
+        Error ->
+            Error
+    end.
+
+%% Analyze results from parallel execution
+analyze_parallel_results(Results) ->
+    ?DEBUG("Analyzing parallel results: ~p", [Results]),
+    
+    TotalPassed = lists:sum([element(2, R) || R <- Results, is_tuple(R), tuple_size(R) >= 2, is_integer(element(2, R))]),
+    TotalFailed = lists:sum([element(1, R) || R <- Results, is_tuple(R), tuple_size(R) >= 2, is_integer(element(1, R))]),
+    
+    case TotalFailed of
+        0 ->
+            ?INFO("All ~p tests passed.", [TotalPassed]),
+            ok;
+        _ ->
+            ?INFO("Failed ~p tests. Passed ~p tests.", [TotalFailed, TotalPassed]),
+            {error, {failures_running_tests, {TotalFailed, 0}}}
+    end.
 
 -spec format_error(any()) -> iolist().
 format_error({error, Reason}) ->
