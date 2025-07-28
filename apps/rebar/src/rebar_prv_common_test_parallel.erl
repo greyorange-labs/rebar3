@@ -91,7 +91,7 @@ run_tests(State, Opts) ->
     Opts1 = setup_logdir(State, T),
     Opts2 = turn_off_auto_compile(Opts1),
     ?DEBUG("Running tests with {ct_opts, ~p}.", [Opts2]),
-    
+
     %% Check if we have spec files to run in parallel
     case proplists:get_value(spec, Opts2) of
         undefined ->
@@ -114,7 +114,7 @@ run_tests(State, Opts) ->
 %% Parallel execution of test suites
 parallel_run_tests(State, Opts) ->
     ?INFO("Running tests in parallel...", []),
-    
+
     case proplists:get_value(spec, Opts) of
         SpecFiles when is_list(SpecFiles) ->
             %% Multiple spec files - run each in parallel
@@ -127,7 +127,7 @@ parallel_run_tests(State, Opts) ->
 %% Run multiple spec files in parallel
 run_parallel_specs(State, Opts, SpecFiles) ->
     ?INFO("Running ~p spec files in parallel", [length(SpecFiles)]),
-    
+
     %% Create tasks for each spec file
     Tasks = lists:map(fun(SpecFile) ->
         fun() ->
@@ -135,22 +135,22 @@ run_parallel_specs(State, Opts, SpecFiles) ->
             run_single_spec_in_node(State, SpecOpts, SpecFile)
         end
     end, SpecFiles),
-    
+
     %% Run tasks in parallel using rebar_parallel
     Results = rebar_parallel:run(Tasks, #{}),
-    
+
     %% Collect and analyze results
     analyze_parallel_results(Results).
 
 %% Run suites from a single spec file in parallel
 run_parallel_suites(State, Opts, SpecFile, ParsedSuites) ->
     ?INFO("Parsing spec file: ~s", [SpecFile]),
-    
+
     %% Parse the spec file to extract individual suites
     case parse_spec_file(SpecFile) of
         {ok, Suites} when length(Suites) > 1 ->
             ?INFO("Found ~p suites, running in parallel", [length(Suites)]),
-            
+
             %% Create tasks for each suite
             Tasks = lists:map(fun(Suite) ->
                 fun() ->
@@ -158,10 +158,10 @@ run_parallel_suites(State, Opts, SpecFile, ParsedSuites) ->
                     run_single_suite_in_node(State, SuiteOpts, Suite)
                 end
             end, Suites),
-            
+
             %% Run tasks in parallel
             Results = rebar_parallel:run(Tasks, #{}),
-            
+
             %% Collect and analyze results
             analyze_parallel_results(Results);
         {ok, [_SingleSuite]} ->
@@ -226,9 +226,9 @@ run_single_suite_in_node(State, Opts, Suite) ->
     %% Create a unique node name for this suite
     {ok, Hostname} = inet:gethostname(),
     NodeName = list_to_atom("ct_parallel_" ++ integer_to_list(erlang:unique_integer([positive])) ++ "@" ++ Hostname),
-    
+
     ?DEBUG("Starting suite ~p in node ~p", [Suite, NodeName]),
-    
+
     %% Set up distributed node if not already distributed
     case node() of
         nonode@nohost ->
@@ -238,11 +238,11 @@ run_single_suite_in_node(State, Opts, Suite) ->
         _ ->
             ok
     end,
-    
+
     %% Get current code path and compiled beam files to share
     CodePaths = code:get_path(),
     LoadedMods = [{Mod, code:which(Mod)} || {Mod, _} <- code:all_loaded(), is_list(code:which(Mod))],
-    
+
     %% Start the worker node
     case start_worker_node(NodeName, CodePaths, LoadedMods) of
         {ok, Node} ->
@@ -277,7 +277,7 @@ start_worker_node(NodeName, CodePaths, LoadedMods) ->
         {ok, Node} ->
             %% Share code paths
             ok = rpc:call(Node, code, set_path, [CodePaths]),
-            
+
             %% Share compiled modules (avoiding recompilation)
             lists:foreach(fun({Mod, BeamFile}) ->
                 case rpc:call(Node, code, ensure_loaded, [Mod]) of
@@ -290,10 +290,10 @@ start_worker_node(NodeName, CodePaths, LoadedMods) ->
                         end
                 end
             end, LoadedMods),
-            
+
             %% Start any necessary applications
             rpc:call(Node, application, ensure_all_started, [common_test]),
-            
+
             {ok, Node};
         Error ->
             Error
@@ -302,10 +302,10 @@ start_worker_node(NodeName, CodePaths, LoadedMods) ->
 %% Analyze results from parallel execution
 analyze_parallel_results(Results) ->
     ?DEBUG("Analyzing parallel results: ~p", [Results]),
-    
+
     TotalPassed = lists:sum([element(2, R) || R <- Results, is_tuple(R), tuple_size(R) >= 2, is_integer(element(2, R))]),
     TotalFailed = lists:sum([element(1, R) || R <- Results, is_tuple(R), tuple_size(R) >= 2, is_integer(element(1, R))]),
-    
+
     case TotalFailed of
         0 ->
             ?INFO("All ~p tests passed.", [TotalPassed]),
