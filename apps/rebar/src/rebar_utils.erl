@@ -640,7 +640,7 @@ expand_sh_flag(use_stdout) ->
     {output_handler,
      fun(Line, Acc) ->
              %% Line already has a newline so don't use ?CONSOLE which adds one
-             io:format("~ts", [Line]),
+            %  io:format("~ts", [Line]),
              [Line | Acc]
      end};
 expand_sh_flag({use_stdout, false}) ->
