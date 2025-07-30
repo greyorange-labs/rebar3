@@ -64,7 +64,7 @@ do(State) ->
 
 do(State, Tests) ->
     {RawOpts, _} = rebar_state:command_parsed_args(State),
-    ?INFO("Running Common Test suites with RawOpts = ~p.", [RawOpts]),
+    ?INFO("Running Common Test suites...", []),
     SlaveNodes0 = proplists:get_value(slave_nodes, RawOpts, []),
     SlaveNodes = [list_to_atom(Node) || Node <- split_string(SlaveNodes0)],
     MasterNode = proplists:get_value(master_node, RawOpts, nonode@nohost),
@@ -191,7 +191,7 @@ run_slave(State, Tests, MasterNode) ->
                     symlink_to_last_ct_logs(State, T),
                     ?INFO("Slave node ~p finished tests successfully, reporting to master node ~p", [Node, MasterNode]),
                     MasterResponse = rpc:call(MasterNode, ?MODULE, slave_node_test_result, [Node, ok]),
-                    ?INFO("Master node ~p response: ~p", [MasterNode, MasterResponse]),
+                    ?DEBUG("Master node ~p response: ~p", [MasterNode, MasterResponse]),
                     {ok, State};
                 Error ->
                     rebar_paths:set_paths([plugins, deps], State),
@@ -220,17 +220,19 @@ run_tests(State, Opts) ->
     T = translate_paths(State, Opts),
     Opts1 = setup_logdir(State, T),
     Opts2 = turn_off_auto_compile(Opts1),
+    ?DEBUG("Running tests with {ct_opts, ~p}.", [Opts2]),
     {RawOpts, _} = rebar_state:command_parsed_args(State),
-    ?INFO("Running tests with {ct_opts, ~p}.", [Opts2]),
-    Result = case proplists:get_value(verbose, RawOpts, false) of
-        true  -> run_test_verbose(Opts2);
-        false -> run_test_quiet(Opts2)
-    end,
     case proplists:get_value(node_type, RawOpts, undefined) of
-        undefined  -> ok = maybe_write_coverdata(State);
-        _Slave -> ok
-    end,
-    Result.
+        slave ->
+            run_test_verbose(Opts2);
+        undefined ->
+            Result = case proplists:get_value(verbose, RawOpts, false) of
+                true  -> run_test_verbose(Opts2);
+                false -> run_test_quiet(Opts2)
+            end,
+            ok = maybe_write_coverdata(State),
+            Result
+    end.
 
 -spec format_error(any()) -> iolist().
 format_error({error, Reason}) ->
@@ -899,10 +901,10 @@ run_test_verbose(Opts) -> handle_results(ct:run_test(Opts)).
 run_test_quiet(Opts) ->
     Pid = self(),
     Ref = erlang:make_ref(),
-    % LogDir = proplists:get_value(logdir, Opts),
+    LogDir = proplists:get_value(logdir, Opts),
     {_, Monitor} = erlang:spawn_monitor(fun() ->
-        % {ok, F} = file:open(filename:join([LogDir, "ct.latest.log"]), [write]),
-        % true = group_leader(F, Pid),
+        {ok, F} = file:open(filename:join([LogDir, "ct.latest.log"]), [write]),
+        true = group_leader(F, Pid),
         Pid ! {Ref, ct:run_test(Opts)}
     end),
     receive
@@ -933,7 +935,7 @@ sum_results(Unknown, _) ->
 handle_quiet_results(_, {error, _} = Result) ->
     handle_results(Result);
 handle_quiet_results(CTOpts, Results) when is_list(Results) ->
-    % _ = [format_result(Result) || Result <- Results],
+    _ = [format_result(Result) || Result <- Results],
     case handle_results(Results) of
         ?PRV_ERROR({failures_running_tests, _}) = Error ->
             LogDir = proplists:get_value(logdir, CTOpts),

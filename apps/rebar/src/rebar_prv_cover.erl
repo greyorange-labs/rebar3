@@ -347,7 +347,7 @@ cover_compile(State, Dirs) ->
     true = redirect_cover_output(State, CoverPid),
     ExclMods = rebar_state:get(State, cover_excl_mods, []),
     ?DEBUG("Ignoring cover compilation of modules in {cover_excl_mods, ~p}", [ExclMods]),
-    ?INFO("Cover compiling modules in directories: ~p", [Dirs]),
+    ?INFO("Cover compiling modules in directories.......", []),
     lists:foreach(fun(Dir) ->
         case file:list_dir(Dir) of
             {ok, Files} ->

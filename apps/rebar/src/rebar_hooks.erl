@@ -109,6 +109,5 @@ apply_hook(Dir, Env, {Arch, Command, Hook}) ->
             ok
     end;
 apply_hook(Dir, Env, {Command, Hook}) ->
-    % ?INFO("Running hook ~p for command ~p in directory ~ts", [Hook, Command, Dir]),
     Msg = lists:flatten(io_lib:format("Hook for ~p failed!~n", [Command])),
     rebar_utils:sh(Hook, [use_stdout, {cd, Dir}, {env, Env}, {abort_on_error, Msg}]).
