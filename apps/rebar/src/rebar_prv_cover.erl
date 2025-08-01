@@ -347,10 +347,10 @@ cover_compile(State, Dirs) ->
     true = redirect_cover_output(State, CoverPid),
     ExclMods = rebar_state:get(State, cover_excl_mods, []),
     ?DEBUG("Ignoring cover compilation of modules in {cover_excl_mods, ~p}", [ExclMods]),
+    ?INFO("Cover compiling ~p directories.......", [length(Dirs)]),
     lists:foreach(fun(Dir) ->
         case file:list_dir(Dir) of
             {ok, Files} ->
-                ?DEBUG("cover compiling ~p", [Dir]),
                 [cover_compile_file(filename:join(Dir, File))
                  || File <- Files,
                     filename:extension(File) == ".beam",
