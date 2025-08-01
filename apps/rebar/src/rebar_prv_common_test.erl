@@ -904,7 +904,7 @@ run_test_quiet(Opts) ->
     LogDir = proplists:get_value(logdir, Opts),
     {_, Monitor} = erlang:spawn_monitor(fun() ->
         {ok, F} = file:open(filename:join([LogDir, "ct.latest.log"]), [write]),
-        true = group_leader(F, Pid),
+        true = group_leader(F, self()),
         Pid ! {Ref, ct:run_test(Opts)}
     end),
     receive
