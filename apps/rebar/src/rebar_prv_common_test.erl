@@ -181,6 +181,8 @@ run_slave(State, Tests, MasterNode) ->
     ?INFO("Waiting for start trigger from master node = ~p...", [MasterNode]),
     ok = wait_for_start_from_master(),
     ?INFO("Received start trigger from master node, proceeding with tests.", []),
+    ConnectedNodes = nodes(connected),
+    lists:foreach(fun(ConnectedNode) -> true = erlang:disconnect_node(ConnectedNode) end, ConnectedNodes -- [MasterNode]),
     case Tests of
         {ok, T} ->
             case run_tests(State, T) of
@@ -194,12 +196,14 @@ run_slave(State, Tests, MasterNode) ->
                     ?DEBUG("Master node ~p response: ~p", [MasterNode, MasterResponse]),
                     {ok, State};
                 Error ->
+                    ?INFO("Slave node ~p finished tests with errors: ~p", [Node, Error]),
                     rebar_paths:set_paths([plugins, deps], State),
                     symlink_to_last_ct_logs(State, T),
                     rpc:call(MasterNode, ?MODULE, slave_node_test_result, [Node, Error]),
                     Error
             end;
         Error ->
+            ?INFO("Error preparing tests on slave node ~p: ~p", [Node, Error]),
             rpc:call(MasterNode, ?MODULE, slave_node_test_result, [Node, Error]),
             rebar_paths:set_paths([plugins, deps], State),
             Error
@@ -343,6 +347,8 @@ transform_opts([{fail_fast, _}|Rest], Acc) ->
 transform_opts([{node_type, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
 transform_opts([{master_node, _}|Rest], Acc) ->
+    transform_opts(Rest, Acc);
+transform_opts([{skip_compile, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
 transform_opts([{slave_nodes, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
@@ -1038,6 +1044,7 @@ ct_opts(_State) ->
      {fail_fast, undefined, "fail_fast", {boolean, false}, help(fail_fast)},
      {node_type, undefined, "node_type", atom, "Type of node to run tests on (master | slave)"},
      {master_node, undefined, "master_node", atom, "Name of the master node to run tests on"},
+     {skip_compile, undefined, "skip_compile", boolean, "Skip compilation of modules in the project with the test configuration"},
      {slave_nodes, undefined, "slave_nodes", string, "Comma-separated list of slave nodes to run tests on"}
     ].
 

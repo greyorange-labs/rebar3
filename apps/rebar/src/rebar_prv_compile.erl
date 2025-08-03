@@ -368,26 +368,33 @@ build_rebar3_apps(DAGs, Apps, State) ->
     LastDAG = lists:last(DAGs),
     %% we actually need to compile each DAG one after the other to prevent
     %% issues where a .yrl file that generates a .erl file gets to be seen.
-    ?INFO("Analyzing applications...", []),
-    [begin
-         {Ctx, ReorderedApps} = rebar_compiler:analyze_all(DAG, Apps),
-         lists:foreach(
-             fun(AppInfo) ->
-                DAG =:= LastDAG andalso
-                  ?INFO("Compiling ~ts", [rebar_app_info:name(AppInfo)]),
-                rebar_compiler:compile_analyzed(DAG, AppInfo, Ctx)
-             end,
-             ReorderedApps
-         ),
-         {ExtraCtx, ReorderedExtraApps} = rebar_compiler:analyze_all_extras(DAG, Apps),
-         lists:foreach(
-             fun(AppInfo) ->
-                rebar_compiler:compile_analyzed(DAG, AppInfo, ExtraCtx)
-             end,
-             ReorderedExtraApps
-         )
-     end || DAG <- DAGs],
-    ok.
+    {RawOpts, _} = rebar_state:command_parsed_args(State),
+    case proplists:get_value(skip_compile, RawOpts, false)  of
+        true ->
+            ok;
+        false ->
+            lists:foreach(
+                fun(DAG) ->
+                    {Ctx, ReorderedApps} = rebar_compiler:analyze_all(DAG, Apps),
+                    lists:foreach(
+                        fun(AppInfo) ->
+                            App = rebar_app_info:name(AppInfo),
+                            DAG == LastDAG andalso ?INFO("Compiling ~ts", [App]),
+                            rebar_compiler:compile_analyzed(DAG, AppInfo, Ctx)
+                        end,
+                        ReorderedApps
+                    ),
+                    {ExtraCtx, ReorderedExtraApps} = rebar_compiler:analyze_all_extras(DAG, Apps),
+                    lists:foreach(
+                        fun(AppInfo) ->
+                            rebar_compiler:compile_analyzed(DAG, AppInfo, ExtraCtx)
+                        end,
+                        ReorderedExtraApps
+                    )
+                end,
+                DAGs
+            )
+    end.
 
 update_code_paths(State, ProjectApps) ->
     ProjAppsPaths = paths_for_apps(ProjectApps),
