@@ -5,9 +5,15 @@
 
 -behaviour(provider).
 
--export([init/1,
-         do/1,
-         format_error/1]).
+-export([
+    init/1,
+    do/1,
+    format_error/1,
+    format_result/1,
+    is_process_ready/1,
+    slave_node_test_result/2,
+    start_test_on_slave/0
+]).
 
 -ifdef(TEST).
 %% exported for test purposes
@@ -57,16 +63,24 @@ do(State) ->
     end.
 
 do(State, Tests) ->
+    {RawOpts, _} = rebar_state:command_parsed_args(State),
     ?INFO("Running Common Test suites...", []),
-    rebar_paths:set_paths([deps, plugins], State),
+    SlaveNodes0 = proplists:get_value(slave_nodes, RawOpts, []),
+    SlaveNodes = [list_to_atom(Node) || Node <- split_string(SlaveNodes0)],
+    MasterNode = proplists:get_value(master_node, RawOpts, nonode@nohost),
+    case proplists:get_value(node_type, RawOpts, undefined) of
+        master -> run_master(State, Tests, SlaveNodes);
+        slave  -> run_slave(State, Tests, MasterNode);
+        undefined -> run_normal(State, Tests)
+    end.
 
+run_normal(State, Tests) ->
+    rebar_paths:set_paths([deps, plugins], State),
     %% Run ct provider prehooks
     Providers = rebar_state:providers(State),
     Cwd = rebar_dir:get_cwd(),
-
     %% Run ct provider pre hooks for all project apps and top level project hooks
     rebar_hooks:run_project_and_app_hooks(Cwd, pre, ?PROVIDER, Providers, State),
-
     case Tests of
         {ok, T} ->
             case run_tests(State, T) of
@@ -82,9 +96,129 @@ do(State, Tests) ->
                     Error
             end;
         Error ->
+            % ?INFO("Error preparing tests on slave node ~p: ~p", [node(), Error]),
             rebar_paths:set_paths([plugins, deps], State),
             Error
     end.
+
+run_master(State, _Tests, SlaveNodes) ->
+    ?INFO("Running Common Test suites...", []),
+    Pid = self(),
+    true = erlang:register(ct_master_process, Pid),
+    ?INFO("Master node = ~p started: ~p", [node(), Pid]),
+    ?INFO("Waiting for slave nodes = ~p to start...", [SlaveNodes]),
+    ok = ensure_ct_process_ready(SlaveNodes, ct_slave_process),
+    ?INFO("Slave nodes started: ~p", [SlaveNodes]),
+    {ok, _} = cover:start(SlaveNodes),
+    ok = trigger_start_tests(SlaveNodes),
+    ?INFO("Waiting for slave nodes to finish tests...", []),
+    AllResults = wait_for_results(SlaveNodes, []),
+    ?INFO("All slave nodes finished tests, results: ~p", [AllResults]),
+    %% Add any master-specific logic here
+    ok = maybe_write_coverdata(State),
+    {ok, State}.
+
+ensure_ct_process_ready(Nodes, ProcessName) ->
+    RemainingNodes = lists:filter(
+        fun(Node) ->
+            case rpc:call(Node, ?MODULE, is_process_ready, [ProcessName]) of
+                true  -> false;
+                _FalseOrNodeDown -> true
+            end
+        end,
+        Nodes
+    ),
+    case RemainingNodes of
+        [] -> ok;
+        _ ->
+            timer:sleep(10),
+            ensure_ct_process_ready(RemainingNodes, ProcessName)
+    end.
+
+is_process_ready(Name) ->
+    case erlang:whereis(Name) of
+        undefined -> false;
+        _Pid      -> true
+    end.
+
+trigger_start_tests(SlaveNodes) ->
+    lists:foreach(
+        fun(Node) ->
+            ?INFO("Trigger start tests on slave node ~p", [Node]),
+            ok = rpc:call(Node, ?MODULE, start_test_on_slave, [])
+        end,
+        SlaveNodes
+    ).
+
+wait_for_results([], AllResults) ->
+    AllResults;
+wait_for_results(SlaveNodes, AllResults) ->
+   receive
+       {ct_slave_node_result, Node, Result} ->
+           ?INFO("Received result from slave node ~p: ~p", [Node, Result]),
+           wait_for_results(lists:delete(Node, SlaveNodes), [{Node, Result} | AllResults])
+   end.
+
+slave_node_test_result(Node, Result) ->
+    Pid = erlang:whereis(ct_master_process),
+    Pid ! {ct_slave_node_result, Node, Result},
+    ok.
+
+run_slave(State, Tests, MasterNode) ->
+    ?INFO("Running Common Test suites... ~p", [node()]),
+    rebar_paths:set_paths([deps, plugins], State),
+    Node = node(),
+    ThisProcess = self(),
+    %% Run ct provider prehooks
+    Providers = rebar_state:providers(State),
+    Cwd = rebar_dir:get_cwd(),
+
+    %% Run ct provider pre hooks for all project apps and top level project hooks
+    rebar_hooks:run_project_and_app_hooks(Cwd, pre, ?PROVIDER, Providers, State),
+    ?INFO("Waiting for master node = ~p to start...", [MasterNode]),
+    ok = ensure_ct_process_ready([MasterNode], ct_master_process),
+    true = erlang:register(ct_slave_process, ThisProcess),
+    ?INFO("Waiting for start trigger from master node = ~p...", [MasterNode]),
+    ok = wait_for_start_from_master(),
+    ?INFO("Received start trigger from master node, proceeding with tests.", []),
+    ConnectedNodes = nodes(connected),
+    lists:foreach(fun(ConnectedNode) -> true = erlang:disconnect_node(ConnectedNode) end, ConnectedNodes -- [MasterNode]),
+    case Tests of
+        {ok, T} ->
+            case run_tests(State, T) of
+                ok    ->
+                    %% Run ct provider post hooks for all project apps and top level project hooks
+                    rebar_hooks:run_project_and_app_hooks(Cwd, post, ?PROVIDER, Providers, State),
+                    rebar_paths:set_paths([plugins, deps], State),
+                    symlink_to_last_ct_logs(State, T),
+                    ?INFO("Slave node ~p finished tests successfully, reporting to master node ~p", [Node, MasterNode]),
+                    MasterResponse = rpc:call(MasterNode, ?MODULE, slave_node_test_result, [Node, ok]),
+                    ?DEBUG("Master node ~p response: ~p", [MasterNode, MasterResponse]),
+                    {ok, State};
+                Error ->
+                    ?INFO("Slave node ~p finished tests with errors: ~p", [Node, Error]),
+                    rebar_paths:set_paths([plugins, deps], State),
+                    symlink_to_last_ct_logs(State, T),
+                    rpc:call(MasterNode, ?MODULE, slave_node_test_result, [Node, Error]),
+                    Error
+            end;
+        Error ->
+            ?INFO("Error preparing tests on slave node ~p: ~p", [Node, Error]),
+            rpc:call(MasterNode, ?MODULE, slave_node_test_result, [Node, Error]),
+            rebar_paths:set_paths([plugins, deps], State),
+            Error
+    end.
+
+wait_for_start_from_master() ->
+    receive
+        {start_tests} ->
+            ok
+    end.
+
+start_test_on_slave() ->
+    Pid = erlang:whereis(ct_slave_process),
+    Pid ! {start_tests},
+    ok.
 
 run_tests(State, Opts) ->
     T = translate_paths(State, Opts),
@@ -92,12 +226,17 @@ run_tests(State, Opts) ->
     Opts2 = turn_off_auto_compile(Opts1),
     ?DEBUG("Running tests with {ct_opts, ~p}.", [Opts2]),
     {RawOpts, _} = rebar_state:command_parsed_args(State),
-    Result = case proplists:get_value(verbose, RawOpts, false) of
-        true  -> run_test_verbose(Opts2);
-        false -> run_test_quiet(Opts2)
-    end,
-    ok = maybe_write_coverdata(State),
-    Result.
+    case proplists:get_value(node_type, RawOpts, undefined) of
+        slave ->
+            run_test_verbose(Opts2);
+        undefined ->
+            Result = case proplists:get_value(verbose, RawOpts, false) of
+                true  -> run_test_verbose(Opts2);
+                false -> run_test_quiet(Opts2)
+            end,
+            ok = maybe_write_coverdata(State),
+            Result
+    end.
 
 -spec format_error(any()) -> iolist().
 format_error({error, Reason}) ->
@@ -204,6 +343,14 @@ transform_opts([{verbose, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
 %% drop fail_fast from opts, ct doesn't care about it
 transform_opts([{fail_fast, _}|Rest], Acc) ->
+    transform_opts(Rest, Acc);
+transform_opts([{node_type, _}|Rest], Acc) ->
+    transform_opts(Rest, Acc);
+transform_opts([{master_node, _}|Rest], Acc) ->
+    transform_opts(Rest, Acc);
+transform_opts([{skip_compile, _}|Rest], Acc) ->
+    transform_opts(Rest, Acc);
+transform_opts([{slave_nodes, _}|Rest], Acc) ->
     transform_opts(Rest, Acc);
 %% getopt should handle anything else
 transform_opts([Opt|Rest], Acc) ->
@@ -762,8 +909,7 @@ run_test_quiet(Opts) ->
     Ref = erlang:make_ref(),
     LogDir = proplists:get_value(logdir, Opts),
     {_, Monitor} = erlang:spawn_monitor(fun() ->
-        {ok, F} = file:open(filename:join([LogDir, "ct.latest.log"]),
-                            [write]),
+        {ok, F} = file:open(filename:join([LogDir, "ct.latest.log"]), [write]),
         true = group_leader(F, self()),
         Pid ! {Ref, ct:run_test(Opts)}
     end),
@@ -833,17 +979,21 @@ format_skipped({User, Auto}) ->
 
 maybe_cover_compile(State) ->
     {RawOpts, _} = rebar_state:command_parsed_args(State),
-    State1 = case proplists:get_value(cover, RawOpts, false) of
-        true  ->
-            S1 = rebar_state:set(State, cover_enabled, true),
-            CoverInclMods = case proplists:get_value(cover_incl_mods, RawOpts) of
-                undefined -> undefined;
-                Mods -> split_string(Mods)
+    case proplists:get_value(node_type, RawOpts, undefined) of
+        slave -> ok;
+        _MasterOrUndefined  ->
+            State1 = case proplists:get_value(cover, RawOpts, false) of
+                true  ->
+                    S1 = rebar_state:set(State, cover_enabled, true),
+                    CoverInclMods = case proplists:get_value(cover_incl_mods, RawOpts) of
+                        undefined -> undefined;
+                        Mods -> split_string(Mods)
+                    end,
+                    rebar_state:set(S1, cover_incl_mods, CoverInclMods);
+                false -> State
             end,
-            rebar_state:set(S1, cover_incl_mods, CoverInclMods);
-        false -> State
-    end,
-    rebar_prv_cover:maybe_cover_compile(State1).
+            rebar_prv_cover:maybe_cover_compile(State1)
+    end.
 
 maybe_write_coverdata(State) ->
     {RawOpts, _} = rebar_state:command_parsed_args(State),
@@ -891,7 +1041,11 @@ ct_opts(_State) ->
      {sys_config, undefined, "sys_config", string, help(sys_config)}, %% comma-separated list
      {compile_only, undefined, "compile_only", boolean, help(compile_only)},
      {retry, undefined, "retry", boolean, help(retry)},
-     {fail_fast, undefined, "fail_fast", {boolean, false}, help(fail_fast)}
+     {fail_fast, undefined, "fail_fast", {boolean, false}, help(fail_fast)},
+     {node_type, undefined, "node_type", atom, "Type of node to run tests on (master | slave)"},
+     {master_node, undefined, "master_node", atom, "Name of the master node to run tests on"},
+     {skip_compile, undefined, "skip_compile", boolean, "Skip compilation of modules in the project with the test configuration"},
+     {slave_nodes, undefined, "slave_nodes", string, "Comma-separated list of slave nodes to run tests on"}
     ].
 
 help(compile_only) ->
