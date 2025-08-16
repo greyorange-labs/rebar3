@@ -42,9 +42,16 @@ init(State) ->
 do(State) ->
     setup_name(State),
     Tests = prepare_tests(State),
+
+    % Time the compilation phase
+    CompileStartTime = erlang:monotonic_time(millisecond),
     case compile(State, Tests) of
         %% successfully compiled apps
         {ok, S} ->
+            CompileEndTime = erlang:monotonic_time(millisecond),
+            CompileDuration = CompileEndTime - CompileStartTime,
+            ?INFO("Compilation phase completed in ~p ms", [CompileDuration]),
+
             {RawOpts, _} = rebar_state:command_parsed_args(S),
             case proplists:get_value(compile_only, RawOpts, false) of
                 true ->
@@ -53,11 +60,19 @@ do(State) ->
                     do(S, Tests)
             end;
         %% this should look like a compiler error, not a ct error
-        Error   -> Error
+        Error   ->
+            CompileEndTime = erlang:monotonic_time(millisecond),
+            CompileDuration = CompileEndTime - CompileStartTime,
+            ?INFO("Compilation phase failed after ~p ms", [CompileDuration]),
+            Error
     end.
 
 do(State, Tests) ->
     ?INFO("Running Common Test suites...", []),
+
+    % Start timing the entire CT process
+    TotalStartTime = erlang:monotonic_time(millisecond),
+
     rebar_paths:set_paths([deps, plugins], State),
 
     %% Run ct provider prehooks
@@ -65,23 +80,56 @@ do(State, Tests) ->
     Cwd = rebar_dir:get_cwd(),
 
     %% Run ct provider pre hooks for all project apps and top level project hooks
+    PreHookStartTime = erlang:monotonic_time(millisecond),
     rebar_hooks:run_project_and_app_hooks(Cwd, pre, ?PROVIDER, Providers, State),
+    PreHookEndTime = erlang:monotonic_time(millisecond),
+    PreHookDuration = PreHookEndTime - PreHookStartTime,
+    ?INFO("Pre-hooks execution completed in ~p ms", [PreHookDuration]),
 
     case Tests of
         {ok, T} ->
+            % Time the actual CT test execution
+            TestStartTime = erlang:monotonic_time(millisecond),
             case run_tests(State, T) of
                 ok    ->
+                    TestEndTime = erlang:monotonic_time(millisecond),
+                    TestDuration = TestEndTime - TestStartTime,
+                    TotalEndTime = erlang:monotonic_time(millisecond),
+                    TotalDuration = TotalEndTime - TotalStartTime,
+
+                    ?INFO("CT test execution completed in ~p ms", [TestDuration]),
+                    ?INFO("Total CT process completed in ~p ms (pre-hooks: ~p ms, tests: ~p ms)",
+                          [TotalDuration, PreHookDuration, TestDuration]),
+
                     %% Run ct provider post hooks for all project apps and top level project hooks
+                    PostHookStartTime = erlang:monotonic_time(millisecond),
                     rebar_hooks:run_project_and_app_hooks(Cwd, post, ?PROVIDER, Providers, State),
+                    PostHookEndTime = erlang:monotonic_time(millisecond),
+                    PostHookDuration = PostHookEndTime - PostHookStartTime,
+                    ?INFO("Post-hooks execution completed in ~p ms", [PostHookDuration]),
+
                     rebar_paths:set_paths([plugins, deps], State),
                     symlink_to_last_ct_logs(State, T),
                     {ok, State};
                 Error ->
+                    TestEndTime = erlang:monotonic_time(millisecond),
+                    TestDuration = TestEndTime - TestStartTime,
+                    TotalEndTime = erlang:monotonic_time(millisecond),
+                    TotalDuration = TotalEndTime - TotalStartTime,
+
+                    ?INFO("CT test execution failed after ~p ms", [TestDuration]),
+                    ?INFO("Total CT process duration: ~p ms (pre-hooks: ~p ms, tests: ~p ms)",
+                          [TotalDuration, PreHookDuration, TestDuration]),
+
                     rebar_paths:set_paths([plugins, deps], State),
                     symlink_to_last_ct_logs(State, T),
                     Error
             end;
         Error ->
+            TotalEndTime = erlang:monotonic_time(millisecond),
+            TotalDuration = TotalEndTime - TotalStartTime,
+            ?INFO("CT process failed during setup after ~p ms (pre-hooks: ~p ms)",
+                  [TotalDuration, PreHookDuration]),
             rebar_paths:set_paths([plugins, deps], State),
             Error
     end.
